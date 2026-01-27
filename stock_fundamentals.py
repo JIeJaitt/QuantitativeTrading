@@ -9,6 +9,72 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import argparse
+import time
+from functools import wraps
+
+
+def retry(max_retries: int = 2, delay: float = 1.0, default=None):
+    """
+    重试装饰器：请求失败时自动重试，全部失败后返回默认值
+
+    Args:
+        max_retries: 最大重试次数，默认2次
+        delay: 重试间隔秒数，默认1秒
+        default: 全部失败后的默认返回值
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            result = None
+            for attempt in range(max_retries + 1):
+                try:
+                    result = func(*args, **kwargs)
+                    # 检查返回值是否有效
+                    if result is not None:
+                        if isinstance(result, pd.DataFrame) and not result.empty:
+                            return result
+                        elif isinstance(result, dict) and result:
+                            return result
+                        elif isinstance(result, (pd.DataFrame, dict)):
+                            # DataFrame 或 dict 为空，继续重试
+                            if attempt < max_retries:
+                                print(
+                                    f"    数据为空，重试中 ({attempt + 1}/{max_retries})..."
+                                )
+                                time.sleep(delay)
+                                continue
+                        else:
+                            return result
+                    if attempt < max_retries:
+                        print(f"    重试中 ({attempt + 1}/{max_retries})...")
+                        time.sleep(delay)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        print(f"    请求失败，重试中 ({attempt + 1}/{max_retries})...")
+                        time.sleep(delay)
+
+            # 所有重试都失败，返回默认值而不是抛出异常
+            if last_exception:
+                print(f"    所有重试均失败: {type(last_exception).__name__}")
+
+            # 根据函数返回类型返回合适的默认值
+            if default is not None:
+                return default
+            # 尝试推断默认返回值
+            if result is not None:
+                return result
+            return (
+                {}
+                if "dict" in str(func.__annotations__.get("return", ""))
+                else pd.DataFrame()
+            )
+
+        return wrapper
+
+    return decorator
 
 
 def is_etf(stock_code: str) -> bool:
@@ -27,9 +93,10 @@ def is_etf(stock_code: str) -> bool:
     return stock_code.startswith(prefixes)
 
 
+@retry(max_retries=2, delay=1.0, default={})
 def get_stock_info(stock_code: str) -> dict:
     """
-    获取股票基本信息
+    获取股票/ETF基本信息（多接口备选）
 
     Args:
         stock_code: 股票代码，如 "000001" 或 "600519"
@@ -37,16 +104,113 @@ def get_stock_info(stock_code: str) -> dict:
     Returns:
         股票基本信息字典
     """
-    try:
-        # 获取个股信息
-        stock_info = ak.stock_individual_info_em(symbol=stock_code)
-        info_dict = dict(zip(stock_info["item"], stock_info["value"]))
-        return info_dict
-    except Exception as e:
-        print(f"获取股票基本信息失败: {e}")
-        return {}
+    info_dict = {}
+
+    # 如果是ETF，使用ETF接口
+    if is_etf(stock_code):
+        # ETF方法1: fund_etf_spot_em
+        try:
+            df = ak.fund_etf_spot_em()
+            if df is not None and not df.empty:
+                etf_data = df[df["代码"] == stock_code]
+                if not etf_data.empty:
+                    row = etf_data.iloc[0]
+                    info_dict = {
+                        "股票简称": row.get("名称", stock_code),
+                        "股票代码": stock_code,
+                        "行业": "-",
+                        "上市时间": "N/A",
+                        "总市值": (
+                            row.get("总市值", "N/A") if "总市值" in row else "N/A"
+                        ),
+                        "流通市值": (
+                            row.get("流通市值", "N/A") if "流通市值" in row else "N/A"
+                        ),
+                        "总股本": "N/A",
+                        "流通股": "N/A",
+                    }
+                    return info_dict
+        except:
+            pass
+
+        # ETF方法2: 从历史数据获取
+        try:
+            end_date = datetime.now().strftime("%Y%m%d")
+            start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
+            df = ak.stock_zh_a_hist(
+                symbol=stock_code,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq",
+            )
+            if df is not None and not df.empty:
+                etf_name = (
+                    df["股票名称"].iloc[0] if "股票名称" in df.columns else stock_code
+                )
+                info_dict = {
+                    "股票简称": etf_name,
+                    "股票代码": stock_code,
+                    "行业": "-",
+                }
+                return info_dict
+        except:
+            pass
+    else:
+        # 股票方法1: stock_individual_info_em
+        try:
+            stock_info = ak.stock_individual_info_em(symbol=stock_code)
+            if stock_info is not None and not stock_info.empty:
+                info_dict = dict(zip(stock_info["item"], stock_info["value"]))
+                return info_dict
+        except:
+            pass
+
+        # 股票方法2: 从实时行情中获取
+        try:
+            df = ak.stock_zh_a_spot_em()
+            if df is not None and not df.empty:
+                stock_data = df[df["代码"] == stock_code]
+                if not stock_data.empty:
+                    row = stock_data.iloc[0]
+                    info_dict = {
+                        "股票简称": row.get("名称", ""),
+                        "股票代码": stock_code,
+                        "总市值": row.get("总市值", "N/A"),
+                        "流通市值": row.get("流通市值", "N/A"),
+                        "行业": (
+                            row.get("所属行业", "N/A") if "所属行业" in row else "N/A"
+                        ),
+                    }
+                    return info_dict
+        except:
+            pass
+
+        # 股票方法3: 从历史数据中提取
+        try:
+            end_date = datetime.now().strftime("%Y%m%d")
+            start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
+            df = ak.stock_zh_a_hist(
+                symbol=stock_code,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq",
+            )
+            if df is not None and not df.empty and "股票名称" in df.columns:
+                info_dict = {
+                    "股票简称": df["股票名称"].iloc[0],
+                    "股票代码": stock_code,
+                }
+                return info_dict
+        except:
+            pass
+
+    # 所有方法都失败，返回基础信息
+    return {"股票代码": stock_code, "股票简称": stock_code}
 
 
+@retry(max_retries=2, delay=1.0, default=pd.DataFrame())
 def get_stock_history(stock_code: str, days: int = 30) -> pd.DataFrame:
     """
     获取股票历史行情数据
@@ -58,28 +222,25 @@ def get_stock_history(stock_code: str, days: int = 30) -> pd.DataFrame:
     Returns:
         历史行情DataFrame
     """
-    try:
-        # 计算起止日期
-        end_date = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=days + 15)).strftime(
-            "%Y%m%d"
-        )  # 多取一些天数确保交易日足够
+    # 计算起止日期
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=days + 15)).strftime(
+        "%Y%m%d"
+    )  # 多取一些天数确保交易日足够
 
-        # 获取日线数据
-        df = ak.stock_zh_a_hist(
-            symbol=stock_code,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",  # 前复权
-        )
+    # 获取日线数据
+    df = ak.stock_zh_a_hist(
+        symbol=stock_code,
+        period="daily",
+        start_date=start_date,
+        end_date=end_date,
+        adjust="qfq",  # 前复权
+    )
 
-        # 只取最近N个交易日
+    # 只取最近N个交易日
+    if df is not None and not df.empty:
         df = df.tail(days)
-        return df
-    except Exception as e:
-        print(f"获取历史行情数据失败: {e}")
-        return pd.DataFrame()
+    return df
 
 
 def get_etf_history(stock_code: str, days: int = 30) -> pd.DataFrame:
@@ -153,6 +314,7 @@ def get_etf_history(stock_code: str, days: int = 30) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+@retry(max_retries=2, delay=1.0, default=pd.DataFrame())
 def get_financial_indicators(stock_code: str) -> pd.DataFrame:
     """
     获取股票财务指标数据
@@ -163,15 +325,14 @@ def get_financial_indicators(stock_code: str) -> pd.DataFrame:
     Returns:
         财务指标DataFrame
     """
-    try:
-        # 获取财务指标
-        df = ak.stock_financial_abstract_ths(symbol=stock_code, indicator="按报告期")
+    # 获取财务指标
+    df = ak.stock_financial_abstract_ths(symbol=stock_code, indicator="按报告期")
+    if df is not None and not df.empty:
         return df.head(4)  # 最近4个报告期
-    except Exception as e:
-        print(f"获取财务指标失败: {e}")
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 
+@retry(max_retries=2, delay=1.0, default={})
 def get_realtime_quote(stock_code: str) -> dict:
     """
     获取股票实时行情
@@ -182,15 +343,13 @@ def get_realtime_quote(stock_code: str) -> dict:
     Returns:
         实时行情字典
     """
-    try:
-        df = ak.stock_zh_a_spot_em()
-        stock_data = df[df["代码"] == stock_code]
-        if not stock_data.empty:
-            return stock_data.iloc[0].to_dict()
+    df = ak.stock_zh_a_spot_em()
+    if df is None or df.empty:
         return {}
-    except Exception as e:
-        print(f"获取实时行情失败: {e}")
-        return {}
+    stock_data = df[df["代码"] == stock_code]
+    if not stock_data.empty:
+        return stock_data.iloc[0].to_dict()
+    return {}
 
 
 def get_etf_realtime_quote(stock_code: str) -> dict:

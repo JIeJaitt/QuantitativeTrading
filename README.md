@@ -15,13 +15,13 @@ pip install -r requirements.txt
 2. 运行程序：
 ```
 # 基本用法（以贵州茅台为例）
-python stock_fundamentals.py 600519
+python main.py 600519
 
 # 指定输出文件名
-python stock_fundamentals.py 600519 -o 茅台报告.md
+python main.py 600519 -o 茅台报告.md
 
 # 指定获取天数（默认30天）
-python stock_fundamentals.py 000001 -d 60
+python main.py 000001 -d 60
 ```
 
 3. 常见股票代码示例：
