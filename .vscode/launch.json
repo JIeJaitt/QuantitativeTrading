@@ -5,13 +5,43 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "159530",
+            "name": "机器人ETF易方达(159530)",
             "type": "debugpy",
             "request": "launch",
             "cwd": "${workspaceFolder}",
             "program": "${workspaceFolder}/main.py",
             "args": [
                 "159530"
+            ]
+        },
+        {
+            "name": "卫星ETF(159206)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "159206"
+            ]
+        },
+        {
+            "name": "化工ETF(159870)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "159870"
+            ]
+        },
+        {
+            "name": "港股通互联网ETF(159792)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "159792"
             ]
         }
     ]

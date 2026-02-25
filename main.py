@@ -1,8 +1,8 @@
 import argparse
 import pandas as pd
-import baostock as bs
 
-from stock_fundamentals_baostock import (
+from stock_data_provider import (
+    check_data_sources,
     get_stock_info,
     get_etf_realtime_quote,
     get_realtime_quote,
@@ -13,6 +13,7 @@ from stock_fundamentals_baostock import (
     generate_markdown,
     is_etf,
     get_financial_indicators,
+    cleanup,
 )
 
 
@@ -34,24 +35,18 @@ def main():
     args = parser.parse_args()
 
     stock_code = args.stock_code
-    output_file = args.output or f"{stock_code}_report.md"
+    custom_output = args.output
     days = args.days
 
-    # 登录 BaoStock
-    print("正在连接 BaoStock...")
-    lg = bs.login()
-    if lg.error_code != "0":
-        print(f"BaoStock 登录失败: {lg.error_msg}")
-        return
+    # 检查可用的数据源
+    check_data_sources()
 
     try:
-        # 判断是ETF还是股票
         is_etf_code = is_etf(stock_code)
         security_type = "ETF" if is_etf_code else "股票"
 
         print(f"正在获取{security_type} {stock_code} 的数据...")
 
-        # 获取各类数据
         print("  - 获取基本信息...")
         stock_info = get_stock_info(stock_code)
 
@@ -75,13 +70,19 @@ def main():
 
         print("  - 获取财务指标...")
         if is_etf_code:
-            # ETF没有财务指标
             financial_df = pd.DataFrame()
             print("    (ETF无财务指标)")
         else:
             financial_df = get_financial_indicators(stock_code)
 
-        # 生成报告
+        # 确定输出文件名：优先用户指定，否则用 名称(代码)_report.md
+        if custom_output:
+            output_file = custom_output
+        else:
+            stock_name = stock_info.get("股票简称", realtime.get("名称", stock_code))
+            safe_name = stock_name.replace("/", "_").replace("\\", "_")
+            output_file = f"{safe_name}({stock_code})_report.md"
+
         print("正在生成Markdown报告...")
         markdown_content = generate_markdown(
             stock_code,
@@ -93,20 +94,16 @@ def main():
             indicators,
         )
 
-        # 保存文件
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(markdown_content)
 
         print(f"报告已生成：{output_file}")
-
-        # 同时输出到控制台
         print("\n" + "=" * 60)
         print(markdown_content)
 
     finally:
-        # 登出 BaoStock
-        bs.logout()
-        print("\n已断开 BaoStock 连接")
+        cleanup()
+        print("\n资源已清理")
 
 
 if __name__ == "__main__":
