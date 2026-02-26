@@ -1,215 +1,122 @@
 """
-统一股票数据接口层 — 多数据源多级回退
+统一股票数据接口层 — 掘金量化
 
-数据源优先级:
-  1. efinance       (实时，轻量级，基于东方财富)
-  2. 东方财富HTTP    (实时，直接请求JSON API，无第三方库依赖)
-  3. AKShare        (实时，功能全面，但接口不稳定)
-  4. BaoStock       (T+1延时，最后兜底)
+数据源: 掘金量化 (MyQuant / GoldMiner)
+  - SDK 安装: pip install gm
+  - 需要掘金终端运行中
+  - token 配置: config/config.yaml 中设置 gm_token 或环境变量 GM_TOKEN
 
-确保在任一数据源不可用或请求失败时，自动切换到下一个。
+主要功能:
+  - 实时行情快照 (current)
+  - 历史日K线 (history_n)
+  - 当日分时数据 (history, 1分钟频率)
 """
+
+import os
 
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
 # ============================================================
-# 数据源可用性检测
+# 掘金量化 SDK
 # ============================================================
 
-_EF_AVAILABLE = False
-_AK_AVAILABLE = False
-_BS_AVAILABLE = False
-_HTTP_AVAILABLE = False
+_GM_AVAILABLE = False
 
 try:
-    import efinance as ef
+    from gm.api import (
+        set_token,
+        current,
+        history,
+        history_n,
+        get_symbol_infos,
+        ADJUST_PREV,
+    )
 
-    _EF_AVAILABLE = True
+    _GM_AVAILABLE = True
 except ImportError:
     pass
 
-try:
-    import akshare as ak
+_GM_INITIALIZED = False
 
-    _AK_AVAILABLE = True
-except ImportError:
-    pass
 
-try:
-    import baostock as bs
+def _load_token() -> str:
+    """从环境变量或 config/config.yaml 中读取掘金 token"""
+    token = os.environ.get("GM_TOKEN", "")
+    if token:
+        return token
+    config_path = os.path.join(os.path.dirname(__file__), "config", "config.yaml")
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("gm_token:"):
+                    token = line.split(":", 1)[1].strip().strip("'\"")
+                    break
+    return token
 
-    _BS_AVAILABLE = True
-except ImportError:
-    pass
 
-try:
-    import requests as _requests
-
-    _HTTP_AVAILABLE = True
-except ImportError:
-    pass
+def _ensure_init():
+    """确保 gm SDK 已初始化（set_token 只需调用一次）"""
+    global _GM_INITIALIZED
+    if _GM_INITIALIZED:
+        return
+    if not _GM_AVAILABLE:
+        raise RuntimeError("掘金量化 SDK 未安装，请执行: pip install gm")
+    token = _load_token()
+    if not token:
+        raise RuntimeError(
+            "掘金 token 未配置！\n"
+            "  方式一: config/config.yaml 中设置 gm_token: your_token\n"
+            "  方式二: 环境变量 GM_TOKEN=your_token"
+        )
+    set_token(token)
+    _GM_INITIALIZED = True
 
 
 def check_data_sources():
-    """检查数据源安装情况 + 实际连通性测试，不通的源直接标记跳过"""
+    """检查掘金量化 SDK 可用性与连通性"""
     print("=" * 50)
 
-    proxies = _get_proxies()
-    if proxies:
-        proxy_addr = proxies.get("http") or proxies.get("https")
-        print(f"代理: {proxy_addr}")
-    else:
-        print("代理: 未配置（如需绕过公司网络，请设置 PROXY_URL 或环境变量）")
-
-    lib_info = [
-        (_EF_AVAILABLE, "efinance", "pip install efinance"),
-        (_HTTP_AVAILABLE, "东方财富HTTP", "pip install requests"),
-        (_AK_AVAILABLE, "AKShare", "pip install akshare"),
-        (_BS_AVAILABLE, "BaoStock", "pip install baostock"),
-    ]
-    installed = sum(1 for a, *_ in lib_info if a)
-    if installed == 0:
+    if not _GM_AVAILABLE:
         raise RuntimeError(
-            "没有可用的数据源！请至少安装一个:\n"
-            "  pip install efinance     (推荐)\n"
-            "  pip install akshare\n"
-            "  pip install baostock"
+            "掘金量化 SDK 未安装！请执行:\n"
+            "  pip install gm\n"
+            "并确保掘金终端已运行"
         )
 
-    # --- 连通性测试 ---
+    token = _load_token()
+    if not token:
+        raise RuntimeError(
+            "掘金量化 token 未配置！请选择以下方式之一:\n"
+            "  1. 在 config/config.yaml 中设置: gm_token: your_token_here\n"
+            "  2. 设置环境变量: set GM_TOKEN=your_token_here\n"
+            "token 可在掘金终端 > 用户 > 密钥管理 中获取"
+        )
+
+    print("数据源: 掘金量化 (MyQuant)")
     print("\n连通性检测:")
+    try:
+        _ensure_init()
+        test = current(symbols="SHSE.600519")
+        if test and len(test) > 0 and test[0].get("price", 0) > 0:
+            price = test[0]["price"]
+            print(f"  [OK] 掘金量化 — 连接成功 (测试: 贵州茅台 {price:.2f})")
+        else:
+            print("  [!!] 掘金量化 — 数据异常（请确保掘金终端已运行）")
+    except Exception as e:
+        print(f"  [!!] 掘金量化 — 连接失败: {e}")
+        print("  请确保:")
+        print("    1. 掘金终端已启动并登录")
+        print("    2. token 正确（用户 > 密钥管理）")
 
-    # 1. 东方财富 API（efinance/东方财富HTTP/AKShare 都依赖它）
-    em_ok = False
-    if _HTTP_AVAILABLE:
-        print("  测试东方财富API...", end="", flush=True)
-        try:
-            data = _em_get(
-                "http://push2.eastmoney.com/api/qt/stock/get?"
-                "secid=1.600519&fields=f57,f58"
-                "&ut=fa5fd1943c7b386f172d6893dbfba10b",
-                timeout=8,
-            )
-            em_ok = bool(data.get("data"))
-        except Exception:
-            pass
-
-        if em_ok:
-            print(" OK")
-        else:
-            print(" 不通")
-
-    if em_ok:
-        # 东方财富通了，逐个确认各库
-        if _EF_AVAILABLE:
-            print("  [OK] efinance      — 可用")
-        else:
-            print("  [--] efinance      — 未安装")
-        print("  [OK] 东方财富HTTP  — 可用")
-        if _AK_AVAILABLE:
-            print("  [OK] AKShare       — 可用")
-        else:
-            print("  [--] AKShare       — 未安装")
-    else:
-        # 东方财富不通，全部标记跳过
-        if _EF_AVAILABLE:
-            _DISABLED_SOURCES.add("efinance")
-            print("  [!!] efinance      — 跳过（东方财富API不通）")
-        else:
-            print("  [--] efinance      — 未安装")
-        _DISABLED_SOURCES.add("东方财富HTTP")
-        print("  [!!] 东方财富HTTP  — 跳过（东方财富API不通）")
-        if _AK_AVAILABLE:
-            _DISABLED_SOURCES.update({"AKShare", "AKShare-ETF"})
-            print("  [!!] AKShare       — 跳过（东方财富API不通）")
-        else:
-            print("  [--] AKShare       — 未安装")
-
-    # 2. BaoStock
-    if _BS_AVAILABLE:
-        print("  测试BaoStock...", end="", flush=True)
-        if _BSSession.ensure_login():
-            print(" OK")
-            print("  [OK] BaoStock      — 可用（T+1延时）")
-        else:
-            print(" 不通")
-            _DISABLED_SOURCES.add("BaoStock")
-            print("  [!!] BaoStock      — 跳过（登录失败）")
-    else:
-        print("  [--] BaoStock      — 未安装")
-
-    available = installed - len(
-        {
-            s
-            for s in _DISABLED_SOURCES
-            if s in {"efinance", "东方财富HTTP", "AKShare", "BaoStock"}
-        }
-    )
-    print(
-        f"\n可用: {available}  跳过: {installed - available}  未安装: {4 - installed}"
-    )
-    if available == 0:
-        print("  [警告] 没有任何数据源可用！请检查网络或代理配置")
     print("=" * 50)
     print()
 
 
 # ============================================================
-# BaoStock 会话管理（懒加载）
-# ============================================================
-
-
-class _BSSession:
-    _logged_in = False
-
-    @classmethod
-    def ensure_login(cls) -> bool:
-        if not _BS_AVAILABLE:
-            return False
-        if cls._logged_in:
-            return True
-        try:
-            lg = bs.login()
-            if lg.error_code == "0":
-                cls._logged_in = True
-                return True
-            print(f"  [BaoStock] 登录失败: {lg.error_msg}")
-        except Exception as e:
-            print(f"  [BaoStock] 登录异常: {e}")
-        return False
-
-    @classmethod
-    def logout(cls):
-        if cls._logged_in and _BS_AVAILABLE:
-            try:
-                bs.logout()
-            except Exception:
-                pass
-            cls._logged_in = False
-
-
-# ============================================================
-# 数据源追踪
-# ============================================================
-
-_source_tracker: dict[str, str] = {}
-_DISABLED_SOURCES: set[str] = set()
-
-
-def get_data_source_summary() -> str:
-    if not _source_tracker:
-        return "未知"
-    sources = set(_source_tracker.values())
-    if len(sources) == 1:
-        return list(sources)[0]
-    details = ", ".join(f"{k}→{v}" for k, v in _source_tracker.items())
-    return f"混合 ({details})"
-
-
-# ============================================================
-# 通用工具
+# 工具函数
 # ============================================================
 
 
@@ -218,728 +125,206 @@ def is_etf(stock_code: str) -> bool:
     return stock_code.startswith(prefixes)
 
 
-def _bs_code(code: str) -> str:
-    """转换为 BaoStock 格式 (sh./sz.)"""
-    return f"sh.{code}" if code.startswith(("6", "5", "9")) else f"sz.{code}"
+def _gm_symbol(code: str) -> str:
+    """转换为掘金格式: 600519 → SHSE.600519, 000001 → SZSE.000001"""
+    return f"SHSE.{code}" if code.startswith(("6", "5", "9")) else f"SZSE.{code}"
 
 
-def _em_market(code: str) -> int:
-    """东方财富市场代码: 0=深圳, 1=上海"""
-    return 1 if code.startswith(("6", "5", "9")) else 0
-
-
-_NUM_COLS = [
-    "开盘",
-    "收盘",
-    "最高",
-    "最低",
-    "成交量",
-    "成交额",
-    "换手率",
-    "涨跌幅",
-    "振幅",
-]
-_HTTP_UA = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0"
-    )
-}
-
-# ============================================================
-# 代理配置
-# 如果公司网络屏蔽了东方财富等数据接口，可以在这里配置本地代理绕过。
-# 支持 HTTP/HTTPS/SOCKS5 代理，格式示例:
-#   "http://127.0.0.1:7890"         — Clash/V2Ray 默认HTTP代理
-#   "socks5://127.0.0.1:1080"       — SOCKS5 代理
-#   ""                              — 不使用代理（留空）
-#
-# 也可以通过环境变量设置（优先级更高）:
-#   set HTTP_PROXY=http://127.0.0.1:7890
-#   set HTTPS_PROXY=http://127.0.0.1:7890
-# ============================================================
-PROXY_URL = "http://127.0.0.1:7897"  # <-- 在这里填写你的代理地址，留空则不使用代理
-
-
-def _get_proxies() -> dict | None:
-    """获取代理配置，环境变量优先于代码中的 PROXY_URL"""
-    import os
-
-    env_http = os.environ.get("HTTP_PROXY", os.environ.get("http_proxy", ""))
-    env_https = os.environ.get("HTTPS_PROXY", os.environ.get("https_proxy", ""))
-
-    if env_http or env_https:
-        return {
-            "http": env_http or env_https,
-            "https": env_https or env_http,
-        }
-    if PROXY_URL:
-        return {"http": PROXY_URL, "https": PROXY_URL}
-    return None
-
-
-def _apply_proxy_to_env():
-    """
-    将代理配置写入环境变量，使 akshare、efinance 等第三方库也走代理。
-    requests 库会自动读取 HTTP_PROXY / HTTPS_PROXY 环境变量。
-    """
-    import os
-
-    # 如果环境变量已经设置了，不覆盖
-    if os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY"):
-        return
-    if PROXY_URL:
-        os.environ["HTTP_PROXY"] = PROXY_URL
-        os.environ["HTTPS_PROXY"] = PROXY_URL
-        os.environ["http_proxy"] = PROXY_URL
-        os.environ["https_proxy"] = PROXY_URL
-
-
-# 模块加载时立即应用，确保所有第三方库都走代理
-_apply_proxy_to_env()
-
-
-def _ensure_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    for col in _NUM_COLS:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-
-def _is_valid(result) -> bool:
-    if result is None:
-        return False
-    if isinstance(result, pd.DataFrame):
-        return not result.empty
-    if isinstance(result, dict):
-        return bool(result)
-    return True
-
-
-def _try_sources(label, sources, default=None):
-    """
-    按优先级尝试多个数据源，返回第一个成功的结果。
-    跳过连通性测试中已标记为不可用的数据源。
-    sources: [(source_name, callable), ...]
-    """
-    for i, (name, func) in enumerate(sources):
-        if name in _DISABLED_SOURCES:
-            continue
-        try:
-            result = func()
-            if _is_valid(result):
-                _source_tracker[label] = name
-                if i > 0:
-                    suffix = "（数据延时T+1）" if name == "BaoStock" else ""
-                    print(f"  [回退] {label} → {name}{suffix}")
-                return result
-        except Exception as e:
-            err_msg = str(e)
-            if not err_msg or err_msg == "None":
-                err_msg = type(e).__name__
-            print(f"  [{name}] {label}失败: {err_msg}")
-    print(f"  [错误] 所有数据源均无法获取{label}")
-    return default if default is not None else pd.DataFrame()
-
-
-def _em_val(d: dict, key: str):
-    """安全提取东方财富API字段值，过滤无效数据"""
-    val = d.get(key)
-    if val is None or val == "-" or val == "":
-        return "N/A"
-    return val
-
-
-def _em_get(url: str, timeout: int = 10) -> dict:
-    """
-    请求东方财富API，自动处理代理、HTTPS/HTTP回退和SSL问题。
-    尝试顺序:
-      1. http://  + 代理（如有）
-      2. http://  无代理
-      3. https:// + verify=False + 代理（如有）
-    全部失败时抛出异常，便于上层看到具体原因。
-    """
-    proxies = _get_proxies()
-    http_url = url.replace("https://", "http://")
-    errors = []
-
-    # 尝试 HTTP + 代理
-    try:
-        resp = _requests.get(
-            http_url,
-            headers=_HTTP_UA,
-            timeout=timeout,
-            proxies=proxies,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        tag = "HTTP+代理" if proxies else "HTTP"
-        errors.append(f"{tag}:{type(e).__name__}")
-
-    # 如果配了代理但失败了，再试不带代理的
-    if proxies:
-        try:
-            resp = _requests.get(http_url, headers=_HTTP_UA, timeout=timeout)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            errors.append(f"HTTP无代理:{type(e).__name__}")
-
-    # 回退: HTTPS + 跳过证书验证
-    import urllib3
-
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    try:
-        https_url = url.replace("http://", "https://")
-        resp = _requests.get(
-            https_url,
-            headers=_HTTP_UA,
-            timeout=timeout,
-            verify=False,
-            proxies=proxies,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        errors.append(f"HTTPS:{type(e).__name__}")
-
-    raise ConnectionError(f"东方财富API连接全部失败 [{', '.join(errors)}]")
+def get_data_source_summary() -> str:
+    return "掘金量化"
 
 
 # ============================================================
-# efinance 数据获取
-# ============================================================
-
-
-def _ef_stock_info(code):
-    if not _EF_AVAILABLE:
-        return None
-    rt = _ef_realtime(code)
-    if not rt:
-        return None
-    return {
-        "股票简称": rt.get("名称", code),
-        "股票代码": code,
-        "总市值": rt.get("总市值", "N/A"),
-        "流通市值": rt.get("流通市值", "N/A"),
-    }
-
-
-def _ef_history(code, days):
-    if not _EF_AVAILABLE:
-        return None
-    end = datetime.now().strftime("%Y%m%d")
-    beg = (datetime.now() - timedelta(days=days + 30)).strftime("%Y%m%d")
-    # ETF 和股票使用相同的 stock 接口获取历史K线
-    df = ef.stock.get_quote_history(code, beg=beg, end=end, klt=101, fqt=1)
-    if df is None or df.empty:
-        return None
-    df = _ensure_numeric(df)
-    return df.tail(days)
-
-
-_EF_KEY_MAP = {
-    "动态市盈率": "市盈率-动态",
-    "股票代码": "代码",
-    "股票名称": "名称",
-    "基金代码": "代码",
-    "基金名称": "名称",
-}
-
-
-def _ef_realtime(code):
-    """efinance 实时行情：股票用 stock 模块，ETF 用 fund 模块"""
-    if not _EF_AVAILABLE:
-        return None
-
-    if is_etf(code):
-        # ETF: 先尝试 fund 模块
-        try:
-            df = ef.fund.get_realtime_quotes()
-            if df is not None and not df.empty:
-                col = "基金代码" if "基金代码" in df.columns else "代码"
-                match = df[df[col] == code]
-                if not match.empty:
-                    d = match.iloc[0].to_dict()
-                    return {_EF_KEY_MAP.get(k, k): v for k, v in d.items()}
-        except Exception:
-            pass
-        # ETF 回退：尝试 stock 模块
-        try:
-            df = ef.stock.get_realtime_quotes([code])
-            if df is not None and not df.empty:
-                d = df.iloc[0].to_dict()
-                return {_EF_KEY_MAP.get(k, k): v for k, v in d.items()}
-        except Exception:
-            pass
-        return None
-
-    # 普通股票
-    df = ef.stock.get_realtime_quotes([code])
-    if df is None or df.empty:
-        return None
-    d = df.iloc[0].to_dict()
-    return {_EF_KEY_MAP.get(k, k): v for k, v in d.items()}
-
-
-# ============================================================
-# 东方财富 HTTP 直连
-# ============================================================
-
-
-def _em_stock_info(code):
-    """从实时行情中提取基本信息"""
-    rt = _em_realtime(code)
-    if not rt:
-        return None
-    return {
-        "股票简称": rt.get("名称", code),
-        "股票代码": code,
-        "总市值": rt.get("总市值", "N/A"),
-        "流通市值": rt.get("流通市值", "N/A"),
-    }
-
-
-def _em_history(code, days):
-    """东方财富 HTTP — 历史日K线"""
-    if not _HTTP_AVAILABLE:
-        return None
-    market = _em_market(code)
-    end = datetime.now().strftime("%Y%m%d")
-    beg = (datetime.now() - timedelta(days=days + 30)).strftime("%Y%m%d")
-
-    url = (
-        f"http://push2his.eastmoney.com/api/qt/stock/kline/get?"
-        f"secid={market}.{code}"
-        f"&fields1=f1,f2,f3,f4,f5,f6"
-        f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
-        f"&klt=101&fqt=1&beg={beg}&end={end}"
-        f"&ut=fa5fd1943c7b386f172d6893dbfba10b"
-    )
-
-    data = _em_get(url)
-
-    if not data.get("data") or not data["data"].get("klines"):
-        return None
-
-    records = []
-    for line in data["data"]["klines"]:
-        p = line.split(",")
-        if len(p) < 11:
-            continue
-        try:
-            records.append(
-                {
-                    "日期": p[0],
-                    "开盘": float(p[1]),
-                    "收盘": float(p[2]),
-                    "最高": float(p[3]),
-                    "最低": float(p[4]),
-                    "成交量": float(p[5]),
-                    "成交额": float(p[6]),
-                    "振幅": float(p[7]),
-                    "涨跌幅": float(p[8]),
-                    "涨跌额": float(p[9]),
-                    "换手率": float(p[10]),
-                }
-            )
-        except (ValueError, IndexError):
-            continue
-
-    if not records:
-        return None
-    return pd.DataFrame(records).tail(days)
-
-
-def _em_realtime(code):
-    """东方财富 HTTP — 实时行情（单只）"""
-    if not _HTTP_AVAILABLE:
-        return None
-    market = _em_market(code)
-
-    url = (
-        f"http://push2.eastmoney.com/api/qt/stock/get?"
-        f"secid={market}.{code}"
-        f"&fields=f18,f43,f44,f45,f46,f47,f48,f50,f57,f58,"
-        f"f116,f117,f162,f167,f168,f170,f171"
-        f"&ut=fa5fd1943c7b386f172d6893dbfba10b"
-        f"&fltt=2&invt=2"
-    )
-
-    data = _em_get(url)
-
-    if not data.get("data"):
-        return None
-
-    d = data["data"]
-    price = _em_val(d, "f43")
-    if price == "N/A":
-        return None
-
-    high = _em_val(d, "f44")
-    low = _em_val(d, "f45")
-    prev_close = _em_val(d, "f18")
-
-    amplitude = "N/A"
-    if (
-        isinstance(prev_close, (int, float))
-        and isinstance(high, (int, float))
-        and isinstance(low, (int, float))
-        and prev_close > 0
-    ):
-        amplitude = round((high - low) / prev_close * 100, 2)
-
-    return {
-        "代码": _em_val(d, "f57"),
-        "名称": _em_val(d, "f58"),
-        "最新价": price,
-        "最高": high,
-        "最低": low,
-        "今开": _em_val(d, "f46"),
-        "成交量": _em_val(d, "f47"),
-        "成交额": _em_val(d, "f48"),
-        "量比": _em_val(d, "f50"),
-        "换手率": _em_val(d, "f168"),
-        "涨跌幅": _em_val(d, "f170"),
-        "涨跌额": _em_val(d, "f171"),
-        "振幅": amplitude,
-        "市盈率-动态": _em_val(d, "f162"),
-        "市净率": _em_val(d, "f167"),
-        "总市值": _em_val(d, "f116"),
-        "流通市值": _em_val(d, "f117"),
-    }
-
-
-# ============================================================
-# AKShare 数据获取
-# ============================================================
-
-
-def _ak_stock_info(code):
-    if not _AK_AVAILABLE:
-        return None
-    if is_etf(code):
-        df = ak.fund_etf_spot_em()
-        if df is not None and not df.empty:
-            match = df[df["代码"] == code]
-            if not match.empty:
-                row = match.iloc[0]
-                return {
-                    "股票简称": row.get("名称", code),
-                    "股票代码": code,
-                    "上市时间": "N/A",
-                    "股票类型": "ETF",
-                }
-        return None
-    info_df = ak.stock_individual_info_em(symbol=code)
-    if info_df is not None and not info_df.empty:
-        return dict(zip(info_df["item"], info_df["value"]))
-    return None
-
-
-def _ak_history(code, days):
-    if not _AK_AVAILABLE:
-        return None
-    end = datetime.now().strftime("%Y%m%d")
-    beg = (datetime.now() - timedelta(days=days + 30)).strftime("%Y%m%d")
-    df = ak.stock_zh_a_hist(
-        symbol=code,
-        period="daily",
-        start_date=beg,
-        end_date=end,
-        adjust="qfq",
-    )
-    if df is None or df.empty:
-        return None
-    df = _ensure_numeric(df)
-    return df.tail(days)
-
-
-def _ak_etf_history(code, days):
-    if not _AK_AVAILABLE:
-        return None
-    end = datetime.now().strftime("%Y%m%d")
-    beg = (datetime.now() - timedelta(days=days + 30)).strftime("%Y%m%d")
-    df = ak.fund_etf_hist_em(
-        symbol=code,
-        period="daily",
-        start_date=beg,
-        end_date=end,
-        adjust="qfq",
-    )
-    if df is None or df.empty:
-        return None
-    df = _ensure_numeric(df)
-    return df.tail(days)
-
-
-def _ak_realtime(code):
-    if not _AK_AVAILABLE:
-        return None
-    df = ak.stock_zh_a_spot_em()
-    if df is None or df.empty:
-        return None
-    match = df[df["代码"] == code]
-    if match.empty:
-        return None
-    return match.iloc[0].to_dict()
-
-
-def _ak_etf_realtime(code):
-    if not _AK_AVAILABLE:
-        return None
-    df = ak.fund_etf_spot_em()
-    if df is None or df.empty:
-        return None
-    match = df[df["代码"] == code]
-    if match.empty:
-        return None
-    return match.iloc[0].to_dict()
-
-
-def _ak_financial(code):
-    if not _AK_AVAILABLE:
-        return None
-    df = ak.stock_financial_abstract_ths(symbol=code, indicator="按报告期")
-    if df is None or df.empty:
-        return None
-    return df.head(4)
-
-
-# ============================================================
-# BaoStock 数据获取
-# ============================================================
-
-
-def _bs_stock_info(code):
-    if not (_BS_AVAILABLE and _BSSession.ensure_login()):
-        return None
-    rs = bs.query_stock_basic(code=_bs_code(code))
-    if rs.error_code != "0":
-        return None
-    rows = []
-    while (rs.error_code == "0") & rs.next():
-        rows.append(rs.get_row_data())
-    if not rows:
-        return None
-    row = rows[0]
-    return {
-        "股票代码": code,
-        "股票简称": row[1] if len(row) > 1 else code,
-        "上市时间": row[2] if len(row) > 2 else "N/A",
-        "股票类型": row[4] if len(row) > 4 else "N/A",
-    }
-
-
-def _bs_history(code, days):
-    if not (_BS_AVAILABLE and _BSSession.ensure_login()):
-        return None
-    start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
-    end = datetime.now().strftime("%Y-%m-%d")
-    rs = bs.query_history_k_data_plus(
-        _bs_code(code),
-        "date,open,high,low,close,volume,amount,turn,pctChg",
-        start_date=start,
-        end_date=end,
-        frequency="d",
-        adjustflag="2",
-    )
-    if rs.error_code != "0":
-        return None
-    rows = []
-    while (rs.error_code == "0") & rs.next():
-        rows.append(rs.get_row_data())
-    if not rows:
-        return None
-    df = pd.DataFrame(rows, columns=rs.fields)
-    df = df.rename(
-        columns={
-            "date": "日期",
-            "open": "开盘",
-            "high": "最高",
-            "low": "最低",
-            "close": "收盘",
-            "volume": "成交量",
-            "amount": "成交额",
-            "turn": "换手率",
-            "pctChg": "涨跌幅",
-        }
-    )
-    df = _ensure_numeric(df)
-    df["振幅"] = ((df["最高"] - df["最低"]) / df["最低"] * 100).round(2)
-    return df.tail(days)
-
-
-def _bs_realtime(code):
-    if not (_BS_AVAILABLE and _BSSession.ensure_login()):
-        return None
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
-    rs = bs.query_history_k_data_plus(
-        _bs_code(code),
-        "date,open,high,low,close,volume,amount,turn,pctChg",
-        start_date=start,
-        end_date=end,
-        frequency="d",
-        adjustflag="2",
-    )
-    if rs.error_code != "0":
-        return None
-    rows = []
-    while (rs.error_code == "0") & rs.next():
-        rows.append(rs.get_row_data())
-    if not rows:
-        return None
-
-    latest = pd.DataFrame(rows, columns=rs.fields).iloc[-1]
-
-    close_v = float(latest["close"]) if latest["close"] else 0
-    pct_v = float(latest["pctChg"]) if latest["pctChg"] else 0
-    high_v = float(latest["high"]) if latest["high"] else 0
-    low_v = float(latest["low"]) if latest["low"] else 0
-
-    result = {
-        "代码": code,
-        "最新价": close_v,
-        "涨跌幅": pct_v,
-        "涨跌额": round(close_v * pct_v / 100, 4) if close_v and pct_v else 0,
-        "今开": float(latest["open"]) if latest["open"] else "N/A",
-        "最高": high_v,
-        "最低": low_v,
-        "成交量": float(latest["volume"]) if latest["volume"] else "N/A",
-        "成交额": float(latest["amount"]) if latest["amount"] else "N/A",
-        "换手率": float(latest["turn"]) if latest["turn"] else "N/A",
-        "振幅": round((high_v - low_v) / low_v * 100, 2) if low_v > 0 else "N/A",
-    }
-
-    # 估值指标
-    try:
-        trade_date = latest["date"]
-        rs_val = bs.query_history_k_data_plus(
-            _bs_code(code),
-            "date,peTTM,pbMRQ",
-            start_date=trade_date,
-            end_date=trade_date,
-            frequency="d",
-            adjustflag="3",
-        )
-        if rs_val.error_code == "0":
-            val_rows = []
-            while (rs_val.error_code == "0") & rs_val.next():
-                val_rows.append(rs_val.get_row_data())
-            if val_rows:
-                v = val_rows[0]
-                result["市盈率-动态"] = v[1] if len(v) > 1 and v[1] else "N/A"
-                result["市净率"] = v[2] if len(v) > 2 and v[2] else "N/A"
-    except Exception:
-        pass
-
-    return result
-
-
-def _bs_financial(code):
-    if not (_BS_AVAILABLE and _BSSession.ensure_login()):
-        return None
-    bsc = _bs_code(code)
-    today = datetime.now()
-    year = today.year
-    quarter = (today.month - 1) // 3 + 1
-
-    all_data = []
-    fields = None
-    for i in range(4):
-        q = quarter - i
-        y = year
-        while q <= 0:
-            q += 4
-            y -= 1
-        rs = bs.query_profit_data(code=bsc, year=y, quarter=q)
-        if rs.error_code == "0":
-            if fields is None:
-                fields = rs.fields
-            while (rs.error_code == "0") & rs.next():
-                row = rs.get_row_data()
-                if row:
-                    all_data.append(row)
-                    break
-
-    if not all_data or not fields:
-        return None
-    return pd.DataFrame(all_data, columns=fields).head(4)
-
-
-# ============================================================
-# 主 API 函数（多级回退）
+# 数据获取
 # ============================================================
 
 
 def get_stock_info(stock_code: str) -> dict:
-    return _try_sources(
-        "基本信息",
-        [
-            ("efinance", lambda: _ef_stock_info(stock_code)),
-            ("东方财富HTTP", lambda: _em_stock_info(stock_code)),
-            ("AKShare", lambda: _ak_stock_info(stock_code)),
-            ("BaoStock", lambda: _bs_stock_info(stock_code)),
-        ],
-        default={"股票代码": stock_code, "股票简称": stock_code},
-    )
+    """获取股票/ETF基本信息（名称、上市日期等）"""
+    _ensure_init()
+    symbol = _gm_symbol(stock_code)
+    sec_types = [1020, 1010] if is_etf(stock_code) else [1010, 1020]
+    for sec_type in sec_types:
+        try:
+            infos = get_symbol_infos(sec_type1=sec_type, symbols=symbol, df=False)
+            if infos and len(infos) > 0:
+                info = infos[0]
+                listed = info.get("listed_date")
+                return {
+                    "股票代码": stock_code,
+                    "股票简称": info.get("sec_name", stock_code),
+                    "上市时间": str(listed)[:10] if listed else "N/A",
+                }
+        except Exception:
+            continue
+    return {"股票代码": stock_code, "股票简称": stock_code}
+
+
+def _get_prev_close(symbol: str) -> float:
+    """获取上一交易日收盘价"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        prev = history_n(
+            symbol=symbol,
+            frequency="1d",
+            count=1,
+            end_time=f"{today} 09:29:00",
+            fields="close",
+            df=False,
+        )
+        if prev and len(prev) > 0:
+            return prev[0].get("close", 0)
+    except Exception:
+        pass
+    return 0
+
+
+def get_realtime_quote(stock_code: str) -> dict:
+    """获取实时行情快照"""
+    _ensure_init()
+    symbol = _gm_symbol(stock_code)
+    try:
+        data = current(symbols=symbol)
+        if not data or len(data) == 0:
+            return {}
+        d = data[0]
+        price = d.get("price", 0)
+        open_p = d.get("open", 0)
+        high = d.get("high", 0)
+        low = d.get("low", 0)
+        cum_volume = d.get("cum_volume", 0)
+        cum_amount = d.get("cum_amount", 0)
+
+        prev_close = _get_prev_close(symbol)
+
+        pct_change = 0
+        change_amount = 0
+        amplitude = 0
+        if prev_close > 0:
+            pct_change = round((price - prev_close) / prev_close * 100, 4)
+            change_amount = round(price - prev_close, 4)
+            if high > 0 and low > 0:
+                amplitude = round((high - low) / prev_close * 100, 2)
+
+        return {
+            "代码": stock_code,
+            "最新价": price,
+            "今开": open_p,
+            "最高": high,
+            "最低": low,
+            "成交量": cum_volume,
+            "成交额": cum_amount,
+            "涨跌幅": pct_change,
+            "涨跌额": change_amount,
+            "振幅": amplitude,
+        }
+    except Exception as e:
+        print(f"  [掘金] 获取实时行情失败: {e}")
+        return {}
+
+
+def get_etf_realtime_quote(stock_code: str) -> dict:
+    return get_realtime_quote(stock_code)
 
 
 def get_stock_history(stock_code: str, days: int = 30) -> pd.DataFrame:
-    sources = [
-        ("efinance", lambda: _ef_history(stock_code, days)),
-        ("东方财富HTTP", lambda: _em_history(stock_code, days)),
-        ("AKShare", lambda: _ak_history(stock_code, days)),
-    ]
-    if is_etf(stock_code):
-        sources.append(("AKShare-ETF", lambda: _ak_etf_history(stock_code, days)))
-    sources.append(("BaoStock", lambda: _bs_history(stock_code, days)))
-    return _try_sources("历史行情", sources)
+    """获取历史日K线数据"""
+    _ensure_init()
+    symbol = _gm_symbol(stock_code)
+    try:
+        df = history_n(
+            symbol=symbol,
+            frequency="1d",
+            count=days,
+            fields="symbol,open,high,low,close,volume,amount,eob,pre_close",
+            adjust=ADJUST_PREV,
+            df=True,
+        )
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.rename(
+            columns={
+                "eob": "日期",
+                "open": "开盘",
+                "close": "收盘",
+                "high": "最高",
+                "low": "最低",
+                "volume": "成交量",
+                "amount": "成交额",
+                "pre_close": "昨收",
+            }
+        )
+
+        df["日期"] = pd.to_datetime(df["日期"]).dt.strftime("%Y-%m-%d")
+        df["涨跌幅"] = ((df["收盘"] - df["昨收"]) / df["昨收"] * 100).round(4)
+        df["振幅"] = ((df["最高"] - df["最低"]) / df["昨收"] * 100).round(2)
+        df["换手率"] = np.nan
+
+        return df[
+            [
+                "日期",
+                "开盘",
+                "收盘",
+                "最高",
+                "最低",
+                "涨跌幅",
+                "成交量",
+                "成交额",
+                "振幅",
+                "换手率",
+            ]
+        ]
+    except Exception as e:
+        print(f"  [掘金] 获取历史行情失败: {e}")
+        return pd.DataFrame()
 
 
 def get_etf_history(stock_code: str, days: int = 30) -> pd.DataFrame:
     return get_stock_history(stock_code, days)
 
 
-def get_realtime_quote(stock_code: str) -> dict:
-    return _try_sources(
-        "实时行情",
-        [
-            ("efinance", lambda: _ef_realtime(stock_code)),
-            ("东方财富HTTP", lambda: _em_realtime(stock_code)),
-            ("AKShare", lambda: _ak_realtime(stock_code)),
-            ("BaoStock", lambda: _bs_realtime(stock_code)),
-        ],
-        default={},
-    )
+def get_intraday_data(stock_code: str) -> pd.DataFrame:
+    """获取今日分时数据（1分钟K线）"""
+    _ensure_init()
+    symbol = _gm_symbol(stock_code)
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        df = history(
+            symbol=symbol,
+            frequency="60s",
+            start_time=f"{today} 09:30:00",
+            end_time=f"{today} 15:00:00",
+            fields="symbol,open,high,low,close,volume,amount,eob",
+            adjust=ADJUST_PREV,
+            df=True,
+        )
+        if df is None or df.empty:
+            return pd.DataFrame()
 
+        df = df.rename(
+            columns={
+                "eob": "时间",
+                "open": "开盘",
+                "close": "收盘",
+                "high": "最高",
+                "low": "最低",
+                "volume": "成交量",
+                "amount": "成交额",
+            }
+        )
 
-def get_etf_realtime_quote(stock_code: str) -> dict:
-    return _try_sources(
-        "实时行情",
-        [
-            ("efinance", lambda: _ef_realtime(stock_code)),
-            ("东方财富HTTP", lambda: _em_realtime(stock_code)),
-            ("AKShare-ETF", lambda: _ak_etf_realtime(stock_code)),
-            ("AKShare", lambda: _ak_realtime(stock_code)),
-            ("BaoStock", lambda: _bs_realtime(stock_code)),
-        ],
-        default={},
-    )
+        df["时间"] = pd.to_datetime(df["时间"]).dt.strftime("%H:%M")
+
+        return df[["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额"]]
+    except Exception as e:
+        print(f"  [掘金] 获取分时数据失败: {e}")
+        return pd.DataFrame()
 
 
 def get_financial_indicators(stock_code: str) -> pd.DataFrame:
-    if is_etf(stock_code):
-        return pd.DataFrame()
-    return _try_sources(
-        "财务指标",
-        [
-            ("AKShare", lambda: _ak_financial(stock_code)),
-            ("BaoStock", lambda: _bs_financial(stock_code)),
-        ],
-    )
+    """获取财务指标（掘金免费版不提供，ETF无财务数据）"""
+    return pd.DataFrame()
 
 
 # ============================================================
@@ -1099,6 +484,7 @@ def generate_markdown(
     stats: dict,
     financial_df: pd.DataFrame,
     indicators: dict = None,
+    intraday_df: pd.DataFrame = None,
 ) -> str:
     report_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     stock_name = stock_info.get("股票简称", realtime.get("名称", stock_code))
@@ -1150,7 +536,30 @@ def generate_markdown(
 
 ---
 
-## 三、{n}日行情统计
+"""
+
+    # 今日分时数据
+    md += "## 三、今日分时数据\n\n"
+    if intraday_df is not None and not intraday_df.empty:
+        md += "| 时间 | 开盘 | 收盘 | 最高 | 最低 | 成交量 | 成交额 |\n"
+        md += "|------|------|------|------|------|--------|--------|\n"
+        for _, row in intraday_df.iterrows():
+            md += (
+                f"| {row.get('时间', 'N/A')} "
+                f"| {row.get('开盘', 'N/A')} "
+                f"| {row.get('收盘', 'N/A')} "
+                f"| {row.get('最高', 'N/A')} "
+                f"| {row.get('最低', 'N/A')} "
+                f"| {format_number(row.get('成交量'), ',.0f')} "
+                f"| {format_number(row.get('成交额'), ',.0f')} |\n"
+            )
+    else:
+        md += "*暂无分时数据（非交易时段或数据不可用）*\n"
+
+    md += f"""
+---
+
+## 四、{n}日行情统计
 
 | 统计指标 | 数值 |
 |----------|------|
@@ -1167,7 +576,7 @@ def generate_markdown(
     md += """
 ---
 
-## 四、技术指标分析
+## 五、技术指标分析
 
 """
 
@@ -1194,7 +603,7 @@ def generate_markdown(
     md += f"""
 ---
 
-## 五、{n}日历史行情明细
+## 六、{n}日历史行情明细
 
 | 日期 | 开盘 | 收盘 | 最高 | 最低 | 涨跌幅 | 成交量 | 换手率 |
 |------|------|------|------|------|--------|--------|--------|
@@ -1218,7 +627,7 @@ def generate_markdown(
     md += """
 ---
 
-## 六、财务指标（最近4个报告期）
+## 七、财务指标（最近4个报告期）
 
 """
 
@@ -1233,7 +642,7 @@ def generate_markdown(
     md += f"""
 ---
 
-## 七、风险提示
+## 八、风险提示
 
 1. 本报告数据来源于公开市场数据，仅供参考，不构成投资建议
 2. 股市有风险，投资需谨慎
@@ -1252,4 +661,4 @@ def generate_markdown(
 
 
 def cleanup():
-    _BSSession.logout()
+    pass

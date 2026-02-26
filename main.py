@@ -8,6 +8,7 @@ from stock_data_provider import (
     get_realtime_quote,
     get_etf_history,
     get_stock_history,
+    get_intraday_data,
     calculate_statistics,
     calculate_technical_indicators,
     generate_markdown,
@@ -38,7 +39,6 @@ def main():
     custom_output = args.output
     days = args.days
 
-    # 检查可用的数据源
     check_data_sources()
 
     try:
@@ -62,6 +62,9 @@ def main():
         else:
             history_df = get_stock_history(stock_code, days)
 
+        print("  - 获取今日分时数据...")
+        intraday_df = get_intraday_data(stock_code)
+
         print("  - 计算统计指标...")
         stats = calculate_statistics(history_df)
 
@@ -75,7 +78,6 @@ def main():
         else:
             financial_df = get_financial_indicators(stock_code)
 
-        # 确定输出文件名：优先用户指定，否则用 名称(代码)_report.md
         if custom_output:
             output_file = custom_output
         else:
@@ -92,6 +94,7 @@ def main():
             stats,
             financial_df,
             indicators,
+            intraday_df,
         )
 
         with open(output_file, "w", encoding="utf-8") as f:
