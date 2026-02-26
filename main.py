@@ -30,7 +30,7 @@ def main():
         help="输出文件名，默认为 {股票代码}_report.md",
     )
     parser.add_argument(
-        "--days", "-d", type=int, default=30, help="获取的历史天数，默认30天"
+        "--days", "-d", type=int, default=50, help="获取的历史天数，默认50天"
     )
 
     args = parser.parse_args()
