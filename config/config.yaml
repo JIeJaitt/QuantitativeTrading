@@ -1,1 +1,4 @@
+# 掘金量化 token 配置示例
+# 实际值请在项目根目录 .env 文件中设置: GM_TOKEN=your_token_here
+# .env 文件已被 .gitignore 忽略，不会被上传到 GitHub
 gm_token: your_token_here

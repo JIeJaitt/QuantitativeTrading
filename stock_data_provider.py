@@ -42,19 +42,33 @@ _GM_INITIALIZED = False
 
 
 def _load_token() -> str:
-    """从环境变量或 config/config.yaml 中读取掘金 token"""
+    """读取掘金 token，优先级: 环境变量 > .env 文件 > config.yaml"""
     token = os.environ.get("GM_TOKEN", "")
     if token:
         return token
+
+    # 从 .env 文件读取
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("GM_TOKEN=") and not line.startswith("#"):
+                    token = line.split("=", 1)[1].strip().strip("'\"")
+                    if token and token != "your_token_here":
+                        return token
+
+    # 兜底: config.yaml
     config_path = os.path.join(os.path.dirname(__file__), "config", "config.yaml")
     if os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("gm_token:"):
-                    token = line.split(":", 1)[1].strip().strip("'\"")
-                    break
-    return token
+                if line.startswith("gm_token:") and not line.startswith("#"):
+                    val = line.split(":", 1)[1].strip().strip("'\"")
+                    if val and val != "your_token_here":
+                        return val
+    return ""
 
 
 def _ensure_init():
