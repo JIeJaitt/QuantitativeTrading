@@ -9,6 +9,7 @@ from stock_data_provider import (
     get_etf_history,
     get_stock_history,
     get_intraday_data,
+    get_multi_period_ma,
     calculate_statistics,
     calculate_technical_indicators,
     generate_markdown,
@@ -65,6 +66,9 @@ def main():
         print("  - 获取今日分时数据...")
         intraday_df = get_intraday_data(stock_code)
 
+        print("  - 计算多周期均线 (日K/周K/月K)...")
+        multi_ma = get_multi_period_ma(stock_code)
+
         print("  - 计算统计指标...")
         stats = calculate_statistics(history_df)
 
@@ -95,6 +99,7 @@ def main():
             financial_df,
             indicators,
             intraday_df,
+            multi_ma,
         )
 
         with open(output_file, "w", encoding="utf-8") as f:

@@ -342,6 +342,115 @@ def get_financial_indicators(stock_code: str) -> pd.DataFrame:
 
 
 # ============================================================
+# 多周期K线与均线
+# ============================================================
+
+_MA_PERIODS = [5, 10, 20, 30, 60]
+
+
+def _aggregate_to_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    """将日K聚合为周K"""
+    d = df.copy()
+    d["_date"] = pd.to_datetime(d["日期"])
+    d["_week"] = d["_date"].dt.isocalendar().year.astype(str) + "-W" + d["_date"].dt.isocalendar().week.astype(str).str.zfill(2)
+    weekly = d.groupby("_week", sort=True).agg(
+        日期=("日期", "last"),
+        开盘=("开盘", "first"),
+        收盘=("收盘", "last"),
+        最高=("最高", "max"),
+        最低=("最低", "min"),
+        成交量=("成交量", "sum"),
+        成交额=("成交额", "sum"),
+    ).reset_index(drop=True)
+    return weekly
+
+
+def _aggregate_to_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    """将日K聚合为月K"""
+    d = df.copy()
+    d["_date"] = pd.to_datetime(d["日期"])
+    d["_month"] = d["_date"].dt.to_period("M")
+    monthly = d.groupby("_month", sort=True).agg(
+        日期=("日期", "last"),
+        开盘=("开盘", "first"),
+        收盘=("收盘", "last"),
+        最高=("最高", "max"),
+        最低=("最低", "min"),
+        成交量=("成交量", "sum"),
+        成交额=("成交额", "sum"),
+    ).reset_index(drop=True)
+    return monthly
+
+
+def _calc_mas(df: pd.DataFrame, periods: list = None) -> dict:
+    """计算均线值和方向，返回 {period: (value, direction)}"""
+    if periods is None:
+        periods = _MA_PERIODS
+    if df.empty:
+        return {}
+    close = df["收盘"].astype(float)
+    result = {}
+    for p in periods:
+        if len(close) < p:
+            continue
+        ma = close.rolling(window=p).mean()
+        val = ma.iloc[-1]
+        prev = ma.iloc[-2] if len(ma) >= 2 and not pd.isna(ma.iloc[-2]) else val
+        direction = "↑" if val > prev else ("↓" if val < prev else "→")
+        result[p] = (round(val, 4), direction)
+    return result
+
+
+def get_multi_period_ma(stock_code: str) -> dict:
+    """获取日K/周K/月K的多周期均线数据
+
+    返回:
+        {
+            "日K": {5: (value, "↑"), 10: (...), ...},
+            "周K": {5: (value, "↓"), ...},
+            "月K": {5: (value, "→"), ...},
+            "latest_price": float,
+        }
+    """
+    _ensure_init()
+    symbol = _gm_symbol(stock_code)
+
+    # 月K MA60 需要 ≥60 个月数据 ≈ 1300 个交易日；取 1500 留余量
+    try:
+        df = history_n(
+            symbol=symbol,
+            frequency="1d",
+            count=1500,
+            fields="symbol,open,high,low,close,volume,amount,eob",
+            adjust=ADJUST_PREV,
+            df=True,
+        )
+    except Exception as e:
+        print(f"  [掘金] 获取扩展历史数据失败: {e}")
+        return {}
+
+    if df is None or df.empty:
+        return {}
+
+    df = df.rename(columns={
+        "eob": "日期", "open": "开盘", "close": "收盘",
+        "high": "最高", "low": "最低", "volume": "成交量", "amount": "成交额",
+    })
+    df["日期"] = pd.to_datetime(df["日期"]).dt.strftime("%Y-%m-%d")
+
+    daily_ma = _calc_mas(df)
+    weekly_ma = _calc_mas(_aggregate_to_weekly(df))
+    monthly_ma = _calc_mas(_aggregate_to_monthly(df))
+
+    return {
+        "日K": daily_ma,
+        "周K": weekly_ma,
+        "月K": monthly_ma,
+        "latest_price": float(df["收盘"].iloc[-1]),
+    }
+
+
+# ============================================================
 # 计算函数（数据源无关）
 # ============================================================
 
@@ -499,6 +608,7 @@ def generate_markdown(
     financial_df: pd.DataFrame,
     indicators: dict = None,
     intraday_df: pd.DataFrame = None,
+    multi_ma: dict = None,
 ) -> str:
     report_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     stock_name = stock_info.get("股票简称", realtime.get("名称", stock_code))
@@ -614,10 +724,34 @@ def generate_markdown(
     else:
         md += "*暂无技术指标数据*\n"
 
+    # 多周期均线
+    md += "\n---\n\n## 六、多周期均线分析\n\n"
+    if multi_ma and any(multi_ma.get(k) for k in ("日K", "周K", "月K")):
+        price = multi_ma.get("latest_price", 0)
+        for label in ("日K", "周K", "月K"):
+            ma_data = multi_ma.get(label, {})
+            if not ma_data:
+                continue
+            md += f"### {label}均线\n\n"
+            md += "| 均线 | 数值 | 方向 | 与现价偏离 |\n"
+            md += "|------|------|------|----------|\n"
+            for p in _MA_PERIODS:
+                if p not in ma_data:
+                    continue
+                val, direction = ma_data[p]
+                deviation = ""
+                if price > 0 and val > 0:
+                    dev_pct = round((price - val) / val * 100, 2)
+                    deviation = f"{dev_pct:+.2f}%"
+                md += f"| MA{p} | {format_number(val, '.4f')} | {direction} | {deviation} |\n"
+            md += "\n"
+    else:
+        md += "*暂无均线数据*\n"
+
     md += f"""
 ---
 
-## 六、{n}日历史行情明细
+## 七、{n}日历史行情明细
 
 | 日期 | 开盘 | 收盘 | 最高 | 最低 | 涨跌幅 | 成交量 | 换手率 |
 |------|------|------|------|------|--------|--------|--------|
@@ -641,7 +775,7 @@ def generate_markdown(
     md += """
 ---
 
-## 七、财务指标（最近4个报告期）
+## 八、财务指标（最近4个报告期）
 
 """
 
@@ -656,7 +790,7 @@ def generate_markdown(
     md += f"""
 ---
 
-## 八、风险提示
+## 九、风险提示
 
 1. 本报告数据来源于公开市场数据，仅供参考，不构成投资建议
 2. 股市有风险，投资需谨慎

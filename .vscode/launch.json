@@ -5,6 +5,16 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "黄金ETF(518880)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "518880"
+            ]
+        },
+        {
             "name": "机器人ETF易方达(159530)",
             "type": "debugpy",
             "request": "launch",
