@@ -53,6 +53,16 @@
             "args": [
                 "159792"
             ]
+        },
+        {
+            "name": "中韩半导体ETF(513310)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "513310"
+            ]
         }
     ]
 }

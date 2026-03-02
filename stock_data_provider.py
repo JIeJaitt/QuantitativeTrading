@@ -31,6 +31,9 @@ try:
         history,
         history_n,
         get_symbol_infos,
+        stk_get_daily_mktvalue_pt,
+        stk_get_daily_valuation_pt,
+        stk_get_daily_basic_pt,
         ADJUST_PREV,
     )
 
@@ -95,9 +98,7 @@ def check_data_sources():
 
     if not _GM_AVAILABLE:
         raise RuntimeError(
-            "掘金量化 SDK 未安装！请执行:\n"
-            "  pip install gm\n"
-            "并确保掘金终端已运行"
+            "掘金量化 SDK 未安装！请执行:\n" "  pip install gm\n" "并确保掘金终端已运行"
         )
 
     token = _load_token()
@@ -148,13 +149,28 @@ def get_data_source_summary() -> str:
     return "掘金量化"
 
 
+_BOARD_MAP = {
+    10100101: "主板",
+    10100102: "创业板",
+    10100103: "科创板",
+    10100104: "北交所",
+    10200101: "股票ETF",
+    10200102: "债券ETF",
+    10200103: "商品ETF",
+    10200104: "跨境ETF",
+    10200105: "货币ETF",
+    10300101: "普通可转债",
+    10300102: "可交换债券",
+}
+
+
 # ============================================================
 # 数据获取
 # ============================================================
 
 
 def get_stock_info(stock_code: str) -> dict:
-    """获取股票/ETF基本信息（名称、上市日期等）"""
+    """获取股票/ETF基本信息（名称、上市日期、板块等）"""
     _ensure_init()
     symbol = _gm_symbol(stock_code)
     sec_types = [1020, 1010] if is_etf(stock_code) else [1010, 1020]
@@ -164,10 +180,12 @@ def get_stock_info(stock_code: str) -> dict:
             if infos and len(infos) > 0:
                 info = infos[0]
                 listed = info.get("listed_date")
+                board_code = info.get("board", 0)
                 return {
                     "股票代码": stock_code,
                     "股票简称": info.get("sec_name", stock_code),
                     "上市时间": str(listed)[:10] if listed else "N/A",
+                    "板块": _BOARD_MAP.get(board_code, "N/A"),
                 }
         except Exception:
             continue
@@ -341,6 +359,71 @@ def get_financial_indicators(stock_code: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def get_stock_extra_data(stock_code: str) -> dict:
+    """获取扩展数据: 市值、估值、换手率等（股票全量，ETF仅市值/换手率）"""
+    _ensure_init()
+    symbol = _gm_symbol(stock_code)
+    etf = is_etf(stock_code)
+    result = {}
+
+    # 市值指标（股票和ETF都尝试）
+    try:
+        mv = stk_get_daily_mktvalue_pt(
+            symbols=symbol, fields="tot_mv,a_mv", df=False
+        )
+        if mv and len(mv) > 0:
+            d = mv[0]
+            tot = d.get("tot_mv", 0)
+            circ = d.get("a_mv", 0)
+            if tot and tot > 0:
+                result["总市值"] = tot
+            if circ and circ > 0:
+                result["流通市值"] = circ
+    except Exception:
+        pass
+
+    # 估值指标（仅股票，ETF无市盈率等）
+    if not etf:
+        try:
+            val = stk_get_daily_valuation_pt(
+                symbols=symbol, fields="pe_ttm,pb_mrq,ps_ttm,dy_ttm", df=False
+            )
+            if val and len(val) > 0:
+                d = val[0]
+                for k, cn in [
+                    ("pe_ttm", "市盈率TTM"),
+                    ("pb_mrq", "市净率"),
+                    ("ps_ttm", "市销率TTM"),
+                    ("dy_ttm", "股息率"),
+                ]:
+                    v = d.get(k)
+                    if v is not None and v != 0:
+                        result[cn] = round(v, 2)
+        except Exception:
+            pass
+
+    # 基础指标（股票和ETF都尝试）
+    try:
+        basic = stk_get_daily_basic_pt(
+            symbols=symbol, fields="turnrate,ttl_shr,circ_shr", df=False
+        )
+        if basic and len(basic) > 0:
+            d = basic[0]
+            tr = d.get("turnrate")
+            if tr is not None:
+                result["换手率"] = round(tr, 2)
+            ts = d.get("ttl_shr")
+            if ts and ts > 0:
+                result["总股本"] = ts
+            cs = d.get("circ_shr")
+            if cs and cs > 0:
+                result["流通股本"] = cs
+    except Exception:
+        pass
+
+    return result
+
+
 # ============================================================
 # 多周期K线与均线
 # ============================================================
@@ -352,16 +435,24 @@ def _aggregate_to_weekly(df: pd.DataFrame) -> pd.DataFrame:
     """将日K聚合为周K"""
     d = df.copy()
     d["_date"] = pd.to_datetime(d["日期"])
-    d["_week"] = d["_date"].dt.isocalendar().year.astype(str) + "-W" + d["_date"].dt.isocalendar().week.astype(str).str.zfill(2)
-    weekly = d.groupby("_week", sort=True).agg(
-        日期=("日期", "last"),
-        开盘=("开盘", "first"),
-        收盘=("收盘", "last"),
-        最高=("最高", "max"),
-        最低=("最低", "min"),
-        成交量=("成交量", "sum"),
-        成交额=("成交额", "sum"),
-    ).reset_index(drop=True)
+    d["_week"] = (
+        d["_date"].dt.isocalendar().year.astype(str)
+        + "-W"
+        + d["_date"].dt.isocalendar().week.astype(str).str.zfill(2)
+    )
+    weekly = (
+        d.groupby("_week", sort=True)
+        .agg(
+            日期=("日期", "last"),
+            开盘=("开盘", "first"),
+            收盘=("收盘", "last"),
+            最高=("最高", "max"),
+            最低=("最低", "min"),
+            成交量=("成交量", "sum"),
+            成交额=("成交额", "sum"),
+        )
+        .reset_index(drop=True)
+    )
     return weekly
 
 
@@ -370,15 +461,19 @@ def _aggregate_to_monthly(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d["_date"] = pd.to_datetime(d["日期"])
     d["_month"] = d["_date"].dt.to_period("M")
-    monthly = d.groupby("_month", sort=True).agg(
-        日期=("日期", "last"),
-        开盘=("开盘", "first"),
-        收盘=("收盘", "last"),
-        最高=("最高", "max"),
-        最低=("最低", "min"),
-        成交量=("成交量", "sum"),
-        成交额=("成交额", "sum"),
-    ).reset_index(drop=True)
+    monthly = (
+        d.groupby("_month", sort=True)
+        .agg(
+            日期=("日期", "last"),
+            开盘=("开盘", "first"),
+            收盘=("收盘", "last"),
+            最高=("最高", "max"),
+            最低=("最低", "min"),
+            成交量=("成交量", "sum"),
+            成交额=("成交额", "sum"),
+        )
+        .reset_index(drop=True)
+    )
     return monthly
 
 
@@ -432,10 +527,17 @@ def get_multi_period_ma(stock_code: str) -> dict:
     if df is None or df.empty:
         return {}
 
-    df = df.rename(columns={
-        "eob": "日期", "open": "开盘", "close": "收盘",
-        "high": "最高", "low": "最低", "volume": "成交量", "amount": "成交额",
-    })
+    df = df.rename(
+        columns={
+            "eob": "日期",
+            "open": "开盘",
+            "close": "收盘",
+            "high": "最高",
+            "low": "最低",
+            "volume": "成交量",
+            "amount": "成交额",
+        }
+    )
     df["日期"] = pd.to_datetime(df["日期"]).dt.strftime("%Y-%m-%d")
 
     daily_ma = _calc_mas(df)
@@ -599,6 +701,23 @@ def format_number(value, fmt: str = ".2f", default: str = "N/A") -> str:
         return default
 
 
+def _fmt_market_cap(val) -> str:
+    """将市值（元）格式化为可读字符串"""
+    if not val or val == "N/A":
+        return "N/A"
+    try:
+        v = float(val)
+        if v >= 1e12:
+            return f"{v / 1e12:.2f} 万亿"
+        if v >= 1e8:
+            return f"{v / 1e8:.2f} 亿"
+        if v >= 1e4:
+            return f"{v / 1e4:.2f} 万"
+        return f"{v:.2f}"
+    except (ValueError, TypeError):
+        return "N/A"
+
+
 def generate_markdown(
     stock_code: str,
     stock_info: dict,
@@ -609,17 +728,23 @@ def generate_markdown(
     indicators: dict = None,
     intraday_df: pd.DataFrame = None,
     multi_ma: dict = None,
+    extra_data: dict = None,
 ) -> str:
     report_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     stock_name = stock_info.get("股票简称", realtime.get("名称", stock_code))
     source = get_data_source_summary()
     n = len(history_df)
 
-    pe = realtime.get(
-        "市盈率-动态",
-        realtime.get("动态市盈率", realtime.get("市盈率TTM", "N/A")),
+    if extra_data is None:
+        extra_data = {}
+
+    pe = extra_data.get(
+        "市盈率TTM",
+        realtime.get("市盈率-动态", realtime.get("动态市盈率", "N/A")),
     )
-    pb = realtime.get("市净率", "N/A")
+    pb = extra_data.get("市净率", realtime.get("市净率", "N/A"))
+    turnover = extra_data.get("换手率", realtime.get("换手率", "N/A"))
+    turnover_str = f"{turnover}%" if turnover != "N/A" else "N/A"
 
     md = f"""# {stock_name}（{stock_code}）基本面分析报告
 
@@ -634,10 +759,10 @@ def generate_markdown(
 |------|------|
 | 股票代码 | {stock_code} |
 | 股票名称 | {stock_name} |
-| 所属行业 | {stock_info.get('行业', stock_info.get('所属行业', 'N/A'))} |
+| 板块 | {stock_info.get('板块', 'N/A')} |
 | 上市时间 | {stock_info.get('上市时间', 'N/A')} |
-| 总市值 | {stock_info.get('总市值', 'N/A')} |
-| 流通市值 | {stock_info.get('流通市值', 'N/A')} |
+| 总市值 | {_fmt_market_cap(extra_data.get('总市值'))} |
+| 流通市值 | {_fmt_market_cap(extra_data.get('流通市值'))} |
 
 ---
 
@@ -653,10 +778,12 @@ def generate_markdown(
 | 最低 | {realtime.get('最低', 'N/A')} |
 | 成交量 | {format_number(realtime.get('成交量'), ',.0f')} |
 | 成交额 | {format_number(realtime.get('成交额'), ',.0f')} |
-| 换手率 | {realtime.get('换手率', 'N/A')}% |
+| 换手率 | {turnover_str} |
 | 振幅 | {format_number(realtime.get('振幅'))}% |
-| 市盈率 | {pe} |
+| 市盈率(TTM) | {pe} |
 | 市净率 | {pb} |
+| 市销率(TTM) | {extra_data.get('市销率TTM', 'N/A')} |
+| 股息率 | {extra_data.get('股息率', 'N/A')}{'%' if extra_data.get('股息率', 'N/A') != 'N/A' else ''} |
 
 ---
 
