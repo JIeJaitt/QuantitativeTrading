@@ -13,9 +13,12 @@
 """
 
 import os
+import json
+import re
 
 import pandas as pd
 import numpy as np
+import requests as _requests
 from datetime import datetime, timedelta
 
 # ============================================================
@@ -34,6 +37,8 @@ try:
         stk_get_daily_mktvalue_pt,
         stk_get_daily_valuation_pt,
         stk_get_daily_basic_pt,
+        stk_get_finance_prime_pt,
+        stk_get_finance_deriv_pt,
         ADJUST_PREV,
     )
 
@@ -355,8 +360,70 @@ def get_intraday_data(stock_code: str) -> pd.DataFrame:
 
 
 def get_financial_indicators(stock_code: str) -> pd.DataFrame:
-    """获取财务指标（掘金免费版不提供，ETF无财务数据）"""
-    return pd.DataFrame()
+    """获取最近4期财务指标（仅A股，ETF返回空）"""
+    if is_etf(stock_code):
+        return pd.DataFrame()
+    _ensure_init()
+    symbol = _gm_symbol(stock_code)
+
+    prime_fields = "inc_oper,net_prof_pcom,eps_basic,roe_weight_avg,inc_oper_yoy,net_prof_pcom_yoy"
+    deriv_fields = "sale_gpm,sale_npm,ast_liab_rate,curr_rate"
+
+    records = []
+    rpt_types = [12, 9, 6, 1]
+    for rpt in rpt_types:
+        row = {}
+        try:
+            prime = stk_get_finance_prime_pt(
+                symbols=symbol, fields=prime_fields,
+                rpt_type=rpt, df=False,
+            )
+            if prime and len(prime) > 0:
+                d = prime[0]
+                rpt_date = d.get("rpt_date", "")
+                if rpt_date:
+                    row["报告期"] = str(rpt_date)[:10]
+                row["营业收入"] = d.get("inc_oper")
+                row["归母净利润"] = d.get("net_prof_pcom")
+                row["基本EPS"] = d.get("eps_basic")
+                row["加权ROE(%)"] = d.get("roe_weight_avg")
+                row["营收同比(%)"] = d.get("inc_oper_yoy")
+                row["净利润同比(%)"] = d.get("net_prof_pcom_yoy")
+        except Exception:
+            pass
+
+        try:
+            deriv = stk_get_finance_deriv_pt(
+                symbols=symbol, fields=deriv_fields,
+                rpt_type=rpt, df=False,
+            )
+            if deriv and len(deriv) > 0:
+                d = deriv[0]
+                row["毛利率(%)"] = d.get("sale_gpm")
+                row["净利率(%)"] = d.get("sale_npm")
+                row["资产负债率(%)"] = d.get("ast_liab_rate")
+                row["流动比率"] = d.get("curr_rate")
+        except Exception:
+            pass
+
+        if row and "报告期" in row:
+            records.append(row)
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    df = df.drop_duplicates(subset=["报告期"]).head(4)
+    df = df.set_index("报告期")
+
+    for col in df.columns:
+        df[col] = df[col].apply(
+            lambda v: _fmt_market_cap(v)
+            if col in ("营业收入", "归母净利润")
+            else (round(v, 2) if isinstance(v, float) and not pd.isna(v) else v)
+        )
+
+    return df
 
 
 def get_stock_extra_data(stock_code: str) -> dict:
@@ -422,6 +489,110 @@ def get_stock_extra_data(stock_code: str) -> dict:
         pass
 
     return result
+
+
+# ============================================================
+# 个股资讯（东方财富）
+# ============================================================
+
+_NEWS_UA = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0"
+    ),
+    "Referer": "https://so.eastmoney.com/",
+}
+
+
+def get_stock_news(stock_code: str, count: int = 10) -> list[dict]:
+    """获取个股相关资讯（来源: 东方财富搜索）
+
+    返回: [{"title": ..., "date": ..., "source": ..., "url": ...}, ...]
+    """
+    stock_info = {}
+    try:
+        _ensure_init()
+        symbol = _gm_symbol(stock_code)
+        infos = get_symbol_infos(
+            sec_type1=1020 if is_etf(stock_code) else 1010,
+            symbols=symbol, df=False,
+        )
+        if infos:
+            stock_info = infos[0]
+    except Exception:
+        pass
+
+    stock_name = stock_info.get("sec_name", stock_code)
+    keyword = f"{stock_code} {stock_name}"
+
+    param = {
+        "uid": "",
+        "keyword": keyword,
+        "type": ["cmsArticleWebOld"],
+        "client": "web",
+        "clientType": "web",
+        "clientVersion": "curr",
+        "param": {
+            "cmsArticleWebOld": {
+                "searchScope": "default",
+                "sort": "default",
+                "pageIndex": 1,
+                "pageSize": count,
+            }
+        },
+    }
+
+    url = (
+        "https://search-api-web.eastmoney.com/search/jsonp"
+        f"?cb=jQuery&param={json.dumps(param, ensure_ascii=False)}"
+    )
+
+    proxies = None
+    proxy_url = os.environ.get("HTTP_PROXY", os.environ.get("http_proxy", ""))
+    if not proxy_url:
+        env_path = os.path.join(os.path.dirname(__file__), ".env")
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("PROXY_URL=") and not line.startswith("#"):
+                        proxy_url = line.split("=", 1)[1].strip().strip("'\"")
+                        break
+    if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
+
+    for attempt_proxies in ([proxies, None] if proxies else [None]):
+        try:
+            resp = _requests.get(
+                url, headers=_NEWS_UA, timeout=10, proxies=attempt_proxies
+            )
+            if resp.status_code != 200:
+                continue
+            text = resp.text
+            json_str = text[text.index("(") + 1 : text.rindex(")")]
+            data = json.loads(json_str)
+
+            articles = data.get("result", {}).get("cmsArticleWebOld", [])
+            if not articles:
+                continue
+
+            _tag_re = re.compile(r"<[^>]+>")
+            news = []
+            for a in articles:
+                title = _tag_re.sub("", a.get("title", ""))
+                if not title:
+                    continue
+                news.append({
+                    "title": title,
+                    "date": a.get("date", "")[:16],
+                    "source": a.get("mediaName", ""),
+                    "url": a.get("url", ""),
+                })
+            return news
+        except Exception:
+            continue
+
+    return []
 
 
 # ============================================================
@@ -729,6 +900,7 @@ def generate_markdown(
     intraday_df: pd.DataFrame = None,
     multi_ma: dict = None,
     extra_data: dict = None,
+    news: list = None,
 ) -> str:
     report_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     stock_name = stock_info.get("股票简称", realtime.get("名称", stock_code))
@@ -902,22 +1074,45 @@ def generate_markdown(
     md += """
 ---
 
-## 八、财务指标（最近4个报告期）
+## 八、财务指标
 
 """
 
     if not financial_df.empty:
-        md += "| 指标 | " + " | ".join(str(c) for c in financial_df.columns) + " |\n"
-        md += "|------" + "|------" * len(financial_df.columns) + "|\n"
-        for idx, row in financial_df.iterrows():
+        # 转置: 报告期作为列头，指标作为行
+        ft = financial_df.T
+        md += "| 指标 | " + " | ".join(str(c) for c in ft.columns) + " |\n"
+        md += "|------" + "|------" * len(ft.columns) + "|\n"
+        for idx, row in ft.iterrows():
             md += f"| {idx} | " + " | ".join(str(v) for v in row.values) + " |\n"
     else:
-        md += "*暂无财务数据*\n"
+        md += "*暂无财务数据（ETF不适用）*\n"
 
     md += f"""
 ---
 
-## 九、风险提示
+## 九、相关资讯
+
+"""
+
+    if news:
+        for item in news:
+            title = item.get("title", "")
+            date = item.get("date", "")
+            source = item.get("source", "")
+            url = item.get("url", "")
+            if url:
+                md += f"- **[{title}]({url})**  \n"
+            else:
+                md += f"- **{title}**  \n"
+            md += f"  {date}　{source}\n"
+    else:
+        md += "*暂无相关资讯*\n"
+
+    md += f"""
+---
+
+## 十、风险提示
 
 1. 本报告数据来源于公开市场数据，仅供参考，不构成投资建议
 2. 股市有风险，投资需谨慎

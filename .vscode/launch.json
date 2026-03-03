@@ -63,6 +63,26 @@
             "args": [
                 "513310"
             ]
+        },
+        {
+            "name": "农发种业(600313)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "600313"
+            ]
+        },
+        {
+            "name": "中科星图(688568)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "688568"
+            ]
         }
     ]
 }
