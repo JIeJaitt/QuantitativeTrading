@@ -12,6 +12,7 @@ from stock_data_provider import (
     get_multi_period_ma,
     get_stock_extra_data,
     get_stock_news,
+    get_stock_boards,
     calculate_statistics,
     calculate_technical_indicators,
     generate_markdown,
@@ -87,6 +88,9 @@ def main():
         else:
             financial_df = get_financial_indicators(stock_code)
 
+        print("  - 获取行业/概念板块...")
+        boards = get_stock_boards(stock_code)
+
         print("  - 获取相关资讯...")
         news = get_stock_news(stock_code)
 
@@ -110,6 +114,7 @@ def main():
             multi_ma,
             extra_data,
             news,
+            boards,
         )
 
         with open(output_file, "w", encoding="utf-8") as f:

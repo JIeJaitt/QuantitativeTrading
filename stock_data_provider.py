@@ -366,7 +366,9 @@ def get_financial_indicators(stock_code: str) -> pd.DataFrame:
     _ensure_init()
     symbol = _gm_symbol(stock_code)
 
-    prime_fields = "inc_oper,net_prof_pcom,eps_basic,roe_weight_avg,inc_oper_yoy,net_prof_pcom_yoy"
+    prime_fields = (
+        "inc_oper,net_prof_pcom,eps_basic,roe_weight_avg,inc_oper_yoy,net_prof_pcom_yoy"
+    )
     deriv_fields = "sale_gpm,sale_npm,ast_liab_rate,curr_rate"
 
     records = []
@@ -375,8 +377,10 @@ def get_financial_indicators(stock_code: str) -> pd.DataFrame:
         row = {}
         try:
             prime = stk_get_finance_prime_pt(
-                symbols=symbol, fields=prime_fields,
-                rpt_type=rpt, df=False,
+                symbols=symbol,
+                fields=prime_fields,
+                rpt_type=rpt,
+                df=False,
             )
             if prime and len(prime) > 0:
                 d = prime[0]
@@ -394,8 +398,10 @@ def get_financial_indicators(stock_code: str) -> pd.DataFrame:
 
         try:
             deriv = stk_get_finance_deriv_pt(
-                symbols=symbol, fields=deriv_fields,
-                rpt_type=rpt, df=False,
+                symbols=symbol,
+                fields=deriv_fields,
+                rpt_type=rpt,
+                df=False,
             )
             if deriv and len(deriv) > 0:
                 d = deriv[0]
@@ -418,9 +424,11 @@ def get_financial_indicators(stock_code: str) -> pd.DataFrame:
 
     for col in df.columns:
         df[col] = df[col].apply(
-            lambda v: _fmt_market_cap(v)
-            if col in ("营业收入", "归母净利润")
-            else (round(v, 2) if isinstance(v, float) and not pd.isna(v) else v)
+            lambda v: (
+                _fmt_market_cap(v)
+                if col in ("营业收入", "归母净利润")
+                else (round(v, 2) if isinstance(v, float) and not pd.isna(v) else v)
+            )
         )
 
     return df
@@ -435,9 +443,7 @@ def get_stock_extra_data(stock_code: str) -> dict:
 
     # 市值指标（股票和ETF都尝试）
     try:
-        mv = stk_get_daily_mktvalue_pt(
-            symbols=symbol, fields="tot_mv,a_mv", df=False
-        )
+        mv = stk_get_daily_mktvalue_pt(symbols=symbol, fields="tot_mv,a_mv", df=False)
         if mv and len(mv) > 0:
             d = mv[0]
             tot = d.get("tot_mv", 0)
@@ -492,16 +498,110 @@ def get_stock_extra_data(stock_code: str) -> dict:
 
 
 # ============================================================
-# 个股资讯（东方财富）
+# 东方财富辅助接口（行业/概念/资讯）
 # ============================================================
 
-_NEWS_UA = {
+_EM_UA = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0"
     ),
-    "Referer": "https://so.eastmoney.com/",
+    "Referer": "https://emweb.securities.eastmoney.com/",
 }
+
+
+def _em_proxies() -> dict | None:
+    """获取代理配置，供东方财富接口使用"""
+    proxy_url = os.environ.get("HTTP_PROXY", os.environ.get("http_proxy", ""))
+    if not proxy_url:
+        env_path = os.path.join(os.path.dirname(__file__), ".env")
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("PROXY_URL=") and not line.startswith("#"):
+                        proxy_url = line.split("=", 1)[1].strip().strip("'\"")
+                        break
+    return {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
+
+def _em_get(url, params=None, timeout=10):
+    """东方财富 HTTP GET，自动处理代理回退"""
+    proxies = _em_proxies()
+    for p in [proxies, None] if proxies else [None]:
+        try:
+            resp = _requests.get(
+                url,
+                params=params,
+                headers=_EM_UA,
+                timeout=timeout,
+                proxies=p,
+            )
+            if resp.status_code == 200:
+                return resp
+        except Exception:
+            continue
+    return None
+
+
+def _em_market(code: str) -> int:
+    return 1 if code.startswith(("6", "5", "9")) else 0
+
+
+def get_stock_boards(stock_code: str) -> dict:
+    """获取个股所属的行业板块和概念板块（来源: 东方财富）
+
+    返回: {"行业板块": "xxx", "概念板块": ["aaa", "bbb", ...]}
+    """
+    result = {"行业板块": "", "概念板块": []}
+
+    # 1. 行业板块: push2 API field f100
+    market = _em_market(stock_code)
+    try:
+        resp = _em_get(
+            "http://push2.eastmoney.com/api/qt/stock/get",
+            params={
+                "secid": f"{market}.{stock_code}",
+                "fields": "f100",
+                "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            },
+        )
+        if resp:
+            d = resp.json().get("data", {})
+            industry = d.get("f100")
+            if industry and industry != "-":
+                result["行业板块"] = industry
+    except Exception:
+        pass
+
+    # 2. 概念板块: datacenter API
+    suffix = "SH" if stock_code.startswith(("6", "5", "9")) else "SZ"
+    try:
+        resp = _em_get(
+            "https://datacenter.eastmoney.com/securities/api/data/v1/get",
+            params={
+                "reportName": "RPT_F10_CORETHEME_BOARDTYPE",
+                "columns": "BOARD_NAME",
+                "filter": f'(SECUCODE="{stock_code}.{suffix}")',
+                "pageNumber": 1,
+                "pageSize": 50,
+                "sortTypes": 1,
+                "sortColumns": "BOARD_RANK",
+                "source": "HSF10",
+                "client": "PC",
+            },
+        )
+        if resp:
+            data = resp.json()
+            rows = data.get("result", {}).get("data", [])
+            if rows:
+                result["概念板块"] = [
+                    r["BOARD_NAME"] for r in rows if r.get("BOARD_NAME")
+                ]
+    except Exception:
+        pass
+
+    return result
 
 
 def get_stock_news(stock_code: str, count: int = 10) -> list[dict]:
@@ -515,7 +615,8 @@ def get_stock_news(stock_code: str, count: int = 10) -> list[dict]:
         symbol = _gm_symbol(stock_code)
         infos = get_symbol_infos(
             sec_type1=1020 if is_etf(stock_code) else 1010,
-            symbols=symbol, df=False,
+            symbols=symbol,
+            df=False,
         )
         if infos:
             stock_info = infos[0]
@@ -547,50 +648,31 @@ def get_stock_news(stock_code: str, count: int = 10) -> list[dict]:
         f"?cb=jQuery&param={json.dumps(param, ensure_ascii=False)}"
     )
 
-    proxies = None
-    proxy_url = os.environ.get("HTTP_PROXY", os.environ.get("http_proxy", ""))
-    if not proxy_url:
-        env_path = os.path.join(os.path.dirname(__file__), ".env")
-        if os.path.exists(env_path):
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("PROXY_URL=") and not line.startswith("#"):
-                        proxy_url = line.split("=", 1)[1].strip().strip("'\"")
-                        break
-    if proxy_url:
-        proxies = {"http": proxy_url, "https": proxy_url}
-
-    for attempt_proxies in ([proxies, None] if proxies else [None]):
-        try:
-            resp = _requests.get(
-                url, headers=_NEWS_UA, timeout=10, proxies=attempt_proxies
-            )
-            if resp.status_code != 200:
-                continue
+    try:
+        resp = _em_get(url)
+        if resp:
             text = resp.text
             json_str = text[text.index("(") + 1 : text.rindex(")")]
             data = json.loads(json_str)
 
             articles = data.get("result", {}).get("cmsArticleWebOld", [])
-            if not articles:
-                continue
-
             _tag_re = re.compile(r"<[^>]+>")
             news = []
-            for a in articles:
+            for a in articles or []:
                 title = _tag_re.sub("", a.get("title", ""))
                 if not title:
                     continue
-                news.append({
-                    "title": title,
-                    "date": a.get("date", "")[:16],
-                    "source": a.get("mediaName", ""),
-                    "url": a.get("url", ""),
-                })
+                news.append(
+                    {
+                        "title": title,
+                        "date": a.get("date", "")[:16],
+                        "source": a.get("mediaName", ""),
+                        "url": a.get("url", ""),
+                    }
+                )
             return news
-        except Exception:
-            continue
+    except Exception:
+        pass
 
     return []
 
@@ -901,6 +983,7 @@ def generate_markdown(
     multi_ma: dict = None,
     extra_data: dict = None,
     news: list = None,
+    boards: dict = None,
 ) -> str:
     report_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     stock_name = stock_info.get("股票简称", realtime.get("名称", stock_code))
@@ -932,10 +1015,17 @@ def generate_markdown(
 | 股票代码 | {stock_code} |
 | 股票名称 | {stock_name} |
 | 板块 | {stock_info.get('板块', 'N/A')} |
+| 行业 | {boards.get('行业板块', 'N/A') if boards else 'N/A'} |
 | 上市时间 | {stock_info.get('上市时间', 'N/A')} |
 | 总市值 | {_fmt_market_cap(extra_data.get('总市值'))} |
 | 流通市值 | {_fmt_market_cap(extra_data.get('流通市值'))} |
+"""
 
+    if boards and boards.get("概念板块"):
+        concepts = "、".join(boards["概念板块"])
+        md += f"| 概念板块 | {concepts} |\n"
+
+    md += f"""
 ---
 
 ## 二、实时行情

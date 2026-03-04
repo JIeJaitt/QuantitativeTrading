@@ -83,6 +83,16 @@
             "args": [
                 "688568"
             ]
+        },
+        {
+            "name": "翠微股份(603123)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "603123"
+            ]
         }
     ]
 }
