@@ -93,6 +93,16 @@
             "args": [
                 "603123"
             ]
+        },
+        {
+            "name": "豫能控股(001896)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "001896"
+            ]
         }
     ]
 }
