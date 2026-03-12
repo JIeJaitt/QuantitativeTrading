@@ -103,6 +103,16 @@
             "args": [
                 "001896"
             ]
+        },
+        {
+            "name": "金开新能(600821)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "600821"
+            ]
         }
     ]
 }
