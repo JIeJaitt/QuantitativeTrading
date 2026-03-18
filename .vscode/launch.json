@@ -105,13 +105,27 @@
             ]
         },
         {
-            "name": "金开新能(600821)",
+            "name": "宝丰能源(600989)",
             "type": "debugpy",
             "request": "launch",
             "cwd": "${workspaceFolder}",
             "program": "${workspaceFolder}/main.py",
             "args": [
-                "600821"
+                "600989"
+            ]
+        },
+        {
+            "name": "博时中证卫星产业指数C（024749）",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "024749",
+                "--type",
+                "fund",
+                "--days",
+                "90"
             ]
         }
     ]
