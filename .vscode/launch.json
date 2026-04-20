@@ -127,6 +127,16 @@
                 "--days",
                 "90"
             ]
-        }
+        },
+                {
+            "name": "圣阳股份(002580)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "002580"
+            ]
+        },
     ]
 }
